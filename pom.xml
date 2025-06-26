@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+		 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<groupId>com.example</groupId>
+	<artifactId>ema-session-manager</artifactId>
+	<version>0.0.1-SNAPSHOT</version>
+	<name>ema-session-manager</name>
+	<description>Spring Boot application with EMA SessionManager using Redis</description>
+
+	<properties>
+		<java.version>17</java.version>
+		<spring-boot.version>3.2.5</spring-boot.version>
+		<ema.version>3.9.0</ema.version>
+	</properties>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter</artifactId>
+			<version>${spring-boot.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-redis</artifactId>
+			<version>${spring-boot.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.refinitiv.ema</groupId>
+			<artifactId>ema</artifactId>
+			<version>${ema.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.refinitiv.eta</groupId>
+			<artifactId>eta</artifactId>
+			<version>${ema.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.refinitiv.eta</groupId>
+			<artifactId>etaValueAdd</artifactId>
+			<version>${ema.version}</version>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+		<plugin>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-maven-plugin</artifactId>
+			<version>${spring-boot.version}</version>
+		</plugin>
+	</build>
+</plugins>
+		</project>
