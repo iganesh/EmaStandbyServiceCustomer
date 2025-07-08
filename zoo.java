@@ -1,0 +1,684 @@
+/* RefinitivTreasuryOmmApplication.java */
+package com.example.refinitivtreasury;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class RefinitivTreasuryOmmApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RefinitivTreasuryOmmApplication.class, args);
+    }
+}
+
+/* TreasuryData.java */
+package com.example.refinitivtreasury.entity;
+
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "Treasury_data")
+public class TreasuryData {
+
+    @Id
+    @Column(name = "ric")
+    private String ric;
+
+    @Column(name = "timestamp")
+    private LocalDateTime timestamp;
+
+    @Column(name = "bid_yield")
+    private Double bidYield;
+
+    @Column(name = "ask_yield")
+    private Double askYield;
+
+    @Column(name = "bid_price")
+    private Double bidPrice;
+
+    @Column(name = "ask_price")
+    private Double askPrice;
+
+    @Column(name = "update_type")
+    private String updateType;
+
+    @Column(name = "last_update")
+    private LocalDateTime lastUpdate;
+
+    public String getRic() { return ric; }
+    public void setRic(String ric) { this.ric = ric; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+    public void setTimestamp(LocalDateTime timestamp) { this.timestamp = timestamp; }
+    public Double getBidYield() { return bidYield; }
+    public void setBidYield(Double bidYield) { this.bidYield = bidYield; }
+    public Double getAskYield() { return askYield; }
+    public void setAskYield(Double askYield) { this.askYield = askYield; }
+    public Double getBidPrice() { return bidPrice; }
+    public void setBidPrice(Double bidPrice) { this.bidPrice = bidPrice; }
+    public Double getAskPrice() { return askPrice; }
+    public void setAskPrice(Double askPrice) { this.askPrice = askPrice; }
+    public String getUpdateType() { return updateType; }
+    public void setUpdateType(String updateType) { this.updateType = updateType; }
+    public LocalDateTime getLastUpdate() { return lastUpdate; }
+    public void setLastUpdate(LocalDateTime lastUpdate) { this.lastUpdate = lastUpdate; }
+}
+
+/* TreasuryPriceDto.java */
+package com.example.refinitivtreasury.dto;
+
+import java.time.LocalDateTime;
+
+public class TreasuryPriceDto {
+    private String ric;
+    private LocalDateTime timestamp;
+    private Double bidYield;
+    private Double askYield;
+    private Double bidPrice;
+    private Double askPrice;
+    private String updateType;
+    private LocalDateTime lastUpdate;
+
+    public String getRic() { return ric; }
+    public void setRic(String ric) { this.ric = ric; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+    public void setTimestamp(LocalDateTime timestamp) { this.timestamp = timestamp; }
+    public Double getBidYield() { return bidYield; }
+    public void setBidYield(Double bidYield) { this.bidYield = bidYield; }
+    public Double getAskYield() { return askYield; }
+    public void setAskYield(Double askYield) { this.askYield = askYield; }
+    public Double getBidPrice() { return bidPrice; }
+    public void setBidPrice(Double bidPrice) { this.bidPrice = bidPrice; }
+    public Double getAskPrice() { return askPrice; }
+    public void setAskPrice(Double askPrice) { this.askPrice = askPrice; }
+    public String getUpdateType() { return updateType; }
+    public void setUpdateType(String updateType) { this.updateType = updateType; }
+    public LocalDateTime getLastUpdate() { return lastUpdate; }
+    public void setLastUpdate(LocalDateTime lastUpdate) { this.lastUpdate = lastUpdate; }
+}
+
+/* TreasuryDataRepository.java */
+package com.example.refinitivtreasury.repository;
+
+import com.example.refinitivtreasury.dto.TreasuryPriceDto;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import oracle.jdbc.OracleConnection;
+import oracle.sql.ARRAY;
+import oracle.sql.ArrayDescriptor;
+import oracle.sql.STRUCT;
+import oracle.sql.StructDescriptor;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.List;
+
+@Repository
+public class TreasuryDataRepository {
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Transactional
+    public void upsert(List<TreasuryPriceDto> prices) {
+        try {
+            OracleConnection oracleConnection = entityManager.unwrap(OracleConnection.class);
+            StructDescriptor structDescriptor = StructDescriptor.createDescriptor("TREASURY_PRICE_T", oracleConnection);
+            ArrayDescriptor arrayDescriptor = ArrayDescriptor.createDescriptor("TREASURY_PRICE_TAB", oracleConnection);
+
+            STRUCT[] structs = new STRUCT[prices.size()];
+            for (int i = 0; i < prices.size(); i++) {
+                TreasuryPriceDto price = prices.get(i);
+                Object[] fields = new Object[]{
+                    price.getRic(),
+                    price.getTimestamp() != null ? Timestamp.valueOf(price.getTimestamp()) : null,
+                    price.getBidYield(),
+                    price.getAskYield(),
+                    price.getBidPrice(),
+                    price.getAskPrice(),
+                    price.getUpdateType(),
+                    price.getLastUpdate() != null ? Timestamp.valueOf(price.getLastUpdate()) : null
+                };
+                structs[i] = new STRUCT(structDescriptor, oracleConnection, fields);
+            }
+            ARRAY array = new ARRAY(arrayDescriptor, oracleConnection, structs);
+
+            String sql = "{call treasury_feeds.load_treasury_prices(?)}";
+            jakarta.persistence.StoredProcedureQuery query = entityManager
+                .createStoredProcedureQuery(sql)
+                .registerStoredProcedureParameter(1, Object.class, jakarta.persistence.ParameterMode.IN)
+                .setParameter(1, array);
+            query.execute();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to call stored procedure", e);
+        }
+    }
+}
+
+/* RefinitivOmmConsumer.java */
+package com.example.refinitivtreasury.service;
+
+import com.example.refinitivtreasury.dto.TreasuryPriceDto;
+import com.refinitiv.ema.access.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+
+@Component
+public class RefinitivOmmConsumer implements OmmConsumerClient {
+
+    private static final Logger logger = LoggerFactory.getLogger(RefinitivOmmConsumer.class);
+    private static final int QUEUE_CAPACITY = 10000;
+    private static final int RECONNECT_INTERVAL_MS = 5000;
+
+    private OmmConsumer consumer;
+    private final BlockingQueue<TreasuryPriceDto> messageQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+    private final List<Long> itemHandles = new ArrayList<>();
+    private final Set<String> subscribedRics = ConcurrentHashMap.newKeySet();
+
+    public void initialize() {
+        int attempts = 0;
+        while (consumer == null && attempts < 3) {
+            try {
+                OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig()
+                        .host("your-refinitiv-host:14002")
+                        .username("your-username")
+                        .password("your-password");
+                consumer = EmaFactory.createOmmConsumer(config);
+                logger.info("OmmConsumer initialized successfully");
+            } catch (OmmException e) {
+                attempts++;
+                logger.error("Failed to initialize OmmConsumer, attempt {}/3", attempts, e);
+                if (attempts < 3) {
+                    try {
+                        Thread.sleep(RECONNECT_INTERVAL_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+        if (consumer == null) {
+            throw new RuntimeException("Failed to initialize OmmConsumer after 3 attempts");
+        }
+    }
+
+    public void subscribeToChain(String chainRic) {
+        try {
+            if (subscribedRics.add(chainRic)) {
+                long handle = consumer.registerClient(
+                        EmaFactory.createReqMsg().serviceName("ELEKTRON_DD").name(chainRic), this);
+                itemHandles.add(handle);
+                logger.info("Subscribed to chain RIC: {}", chainRic);
+            }
+        } catch (OmmException e) {
+            logger.error("Failed to subscribe to chain RIC: {}", chainRic, e);
+            subscribedRics.remove(chainRic);
+        }
+    }
+
+    public void unsubscribeAll() {
+        for (Long handle : itemHandles) {
+            try {
+                consumer.unregister(handle);
+                logger.info("Unsubscribed handle: {}", handle);
+            } catch (OmmException e) {
+                logger.error("Failed to unsubscribe handle: {}", handle, e);
+            }
+        }
+        itemHandles.clear();
+        subscribedRics.clear();
+    }
+
+    public void shutdown() {
+        if (consumer != null) {
+            try {
+                consumer.uninitialize();
+                logger.info("OmmConsumer shutdown successfully");
+            } catch (OmmException e) {
+                logger.error("Failed to shutdown OmmConsumer", e);
+            }
+        }
+    }
+
+    @Override
+    public void onRefreshMsg(RefreshMsg refreshMsg, OmmConsumerEvent event) {
+        logger.debug("Received refresh message for RIC: {}", refreshMsg.name());
+        processMessage(refreshMsg, "REFRESH");
+    }
+
+    @Override
+    public void onUpdateMsg(UpdateMsg updateMsg, OmmConsumerEvent event) {
+        logger.debug("Received update message for RIC: {}", updateMsg.name());
+        processMessage(updateMsg, "UPDATE");
+    }
+
+    @Override
+    public void onStatusMsg(StatusMsg statusMsg, OmmConsumerEvent event) {
+        logger.info("Received status message for RIC: {}, State: {}", statusMsg.name(), statusMsg.state());
+    }
+
+    private void processMessage(Msg msg, String updateType) {
+        try {
+            if (msg.domainType() == EmaRdm.MMT_MARKET_PRICE) {
+                processMarketPrice(msg, updateType);
+            } else if (msg.domainType() == EmaRdm.MMT_MARKET_BY_PRICE) {
+                processChain(msg);
+            }
+        } catch (Exception e) {
+            logger.error("Error processing message for RIC: {}", msg.name(), e);
+        }
+    }
+
+    private void processMarketPrice(Msg msg, String updateType) {
+        TreasuryPriceDto dto = new TreasuryPriceDto();
+        dto.setRic(msg.name());
+        dto.setTimestamp(LocalDateTime.now());
+        dto.setUpdateType(updateType);
+        dto.setLastUpdate(LocalDateTime.now());
+
+        FieldList fieldList = msg.payload().fieldList();
+        for (FieldEntry entry : fieldList) {
+            switch (entry.fieldId()) {
+                case 22: // BID
+                    dto.setBidPrice(entry.doubleValue());
+                    break;
+                case 25: // ASK
+                    dto.setAskPrice(entry.doubleValue());
+                    break;
+                case 393: // YLD_1 (Bid Yield)
+                    dto.setBidYield(entry.doubleValue());
+                    break;
+                case 396: // ASK_YLD
+                    dto.setAskYield(entry.doubleValue());
+                    break;
+            }
+        }
+
+        if (dto.getRic() != null && !dto.getRic().isEmpty()) {
+            if (!messageQueue.offer(dto)) {
+                logger.warn("Message queue full, dropping message for RIC: {}", dto.getRic());
+            } else {
+                logger.debug("Queued TreasuryPriceDto for RIC: {}", dto.getRic());
+            }
+        } else {
+            logger.warn("Invalid RIC in message: {}", msg.name());
+        }
+    }
+
+    private void processChain(Msg msg) {
+        if (msg.payload().map() != null) {
+            Map map = msg.payload().map();
+            for (MapEntry entry : map) {
+                if (entry.key().dataType() == DataType.DataTypes.ASCII) {
+                    String ric = entry.key().ascii();
+                    if (subscribedRics.add(ric)) {
+                        try {
+                            long handle = consumer.registerClient(
+                                    EmaFactory.createReqMsg().serviceName("ELEKTRON_DD").name(ric), this);
+                            itemHandles.add(handle);
+                            logger.info("Subscribed to chain constituent RIC: {}", ric);
+                        } catch (OmmException e) {
+                            logger.error("Failed to subscribe to RIC: {}", ric, e);
+                            subscribedRics.remove(ric);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public TreasuryPriceDto pollMessage() {
+        return messageQueue.poll();
+    }
+}
+
+/* LeaderElectionService.java */
+package com.example.refinitivtreasury.service;
+
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.util.UUID;
+
+@Service
+public class LeaderElectionService {
+
+    private static final Logger logger = LoggerFactory.getLogger(LeaderElectionService.class);
+    private static final String ZK_CONNECTION_STRING = "localhost:2181";
+    private static final String LEADER_PATH = "/refinitiv/leader";
+    private final CuratorFramework client;
+    private final LeaderLatch leaderLatch;
+
+    public LeaderElectionService() {
+        this.client = CuratorFrameworkFactory.newClient(
+            ZK_CONNECTION_STRING,
+            new ExponentialBackoffRetry(1000, 3)
+        );
+        this.leaderLatch = new LeaderLatch(client, LEADER_PATH, UUID.randomUUID().toString());
+    }
+
+    @PostConstruct
+    public void init() {
+        try {
+            client.start();
+            leaderLatch.start();
+            logger.info("Leader election initialized with ID: {}", leaderLatch.getId());
+        } catch (Exception e) {
+            logger.error("Failed to initialize leader election", e);
+            throw new RuntimeException("Leader election initialization failed", e);
+        }
+    }
+
+    @PreDestroy
+    public void destroy() {
+        try {
+            leaderLatch.close();
+            client.close();
+            logger.info("Leader election shutdown");
+        } catch (Exception e) {
+            logger.error("Failed to shutdown leader election", e);
+        }
+    }
+
+    public boolean isLeader() {
+        return leaderLatch.hasLeadership();
+    }
+}
+
+/* TreasuryDataService.java */
+package com.example.refinitivtreasury.service;
+
+import com.example.refinitivtreasury.dto.TreasuryPriceDto;
+import com.example.refinitivtreasury.repository.TreasuryDataRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Gauge;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.DayOfWeek;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class TreasuryDataService {
+
+    @Autowired
+    private RefinitivOmmConsumer ommConsumer;
+
+    @Autowired
+    private TreasuryDataRepository repository;
+
+    @Autowired
+    private LeaderElectionService leaderElectionService;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    private final List<TreasuryPriceDto> batch = new ArrayList<>();
+    private static final int BATCH_SIZE = 1000;
+
+    @PostConstruct
+    public void init() {
+        ommConsumer.initialize();
+        Gauge.builder("message.queue.size", batch, List::size)
+             .description("Size of the TreasuryPriceDto batch queue")
+             .register(meterRegistry);
+    }
+
+    @PreDestroy
+    public void destroy() {
+        ommConsumer.shutdown();
+    }
+
+    private boolean isWithinOperatingHours() {
+        LocalDateTime now = LocalDateTime.now(ZoneId.of("Asia/Kolkata"));
+        LocalTime time = now.toLocalTime();
+        DayOfWeek day = now.getDayOfWeek();
+        return day != DayOfWeek.SATURDAY && day != DayOfWeek.SUNDAY &&
+               time.isAfter(LocalTime.of(3, 0)) && time.isBefore(LocalTime.of(23, 0));
+    }
+
+    @Scheduled(cron = "0 0 3 * * MON-FRI", zone = "Asia/Kolkata")
+    public void startConsumer() {
+        if (isWithinOperatingHours() && leaderElectionService.isLeader()) {
+            ommConsumer.subscribeToChain("0#USTSY=");
+        }
+    }
+
+    @Scheduled(cron = "0 0 23 * * MON-FRI", zone = "Asia/Kolkata")
+    public void stopConsumer() {
+        if (leaderElectionService.isLeader()) {
+            ommConsumer.unsubscribeAll();
+        }
+    }
+
+    @Scheduled(fixedRate = 1000, scheduler = "messageProcessorExecutor")
+    @Transactional
+    public void processMessages() {
+        if (!isWithinOperatingHours() || !leaderElectionService.isLeader()) {
+            return;
+        }
+
+        TreasuryPriceDto dto;
+        while ((dto = ommConsumer.pollMessage()) != null) {
+            batch.add(dto);
+            if (batch.size() >= BATCH_SIZE) {
+                repository.upsert(new ArrayList<>(batch));
+                batch.clear();
+            }
+        }
+    }
+
+    @Scheduled(fixedRate = 5000, scheduler = "messageProcessorExecutor")
+    @Transactional
+    public void flushBatch() {
+        if (!isWithinOperatingHours() || !leaderElectionService.isLeader() || batch.isEmpty()) {
+            return;
+        }
+        repository.upsert(new ArrayList<>(batch));
+        batch.clear();
+    }
+}
+
+/* ThreadPoolConfig.java */
+package com.example.refinitivtreasury.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+@Configuration
+public class ThreadPoolConfig {
+    @Bean(name = "messageProcessorExecutor")
+    public ThreadPoolTaskExecutor messageProcessorExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(8);
+        executor.setQueueCapacity(1000);
+        executor.setThreadNamePrefix("MessageProcessor-");
+        executor.initialize();
+        return executor;
+    }
+}
+
+/* application.properties */
+spring.datasource.url=jdbc:oracle:thin:@localhost:1521:ORCL
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=oracle.jdbc.OracleDriver
+spring.jpa.hibernate.ddl-auto=none
+spring.jpa.database-platform=org.hibernate.dialect.Oracle12cDialect
+spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.minimum-idle=5
+management.endpoints.web.exposure.include=health,metrics,prometheus
+zookeeper.connect-string=localhost:2181
+
+/* pom.xml */
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <groupId>com.example</groupId>
+    <artifactId>refinitiv-treasury-omm</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>refinitiv-treasury-omm</name>
+    <description>Spring Boot OMM application for Refinitiv Treasury data</description>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.0</version>
+        <relativePath/>
+    </parent>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc8</artifactId>
+            <version>21.7.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.9</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.4.11</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+            <version>5.5.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.refinitiv.ema</groupId>
+            <artifactId>ema</artifactId>
+            <version>3.6.7.0</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/lib/ema.jar</systemPath>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+/* oracle_types_and_procedure.sql */
+CREATE OR REPLACE TYPE TREASURY_PRICE_T AS OBJECT (
+    ric VARCHAR2(50),
+    timestamp TIMESTAMP,
+    bid_yield NUMBER(10,4),
+    ask_yield NUMBER(10,4),
+    bid_price NUMBER(10,4),
+    ask_price NUMBER(10,4),
+    update_type VARCHAR2(20),
+    last_update TIMESTAMP
+);
+
+CREATE OR REPLACE TYPE TREASURY_PRICE_TAB AS TABLE OF TREASURY_PRICE_T;
+
+CREATE OR REPLACE PACKAGE treasury_feeds AS
+    PROCEDURE load_treasury_prices(p_prices IN TREASURY_PRICE_TAB);
+END treasury_feeds;
+/
+
+CREATE OR REPLACE PACKAGE BODY treasury_feeds AS
+    PROCEDURE load_treasury_prices(p_prices IN TREASURY_PRICE_TAB) IS
+    BEGIN
+        FORALL i IN 1..p_prices.COUNT
+            MERGE INTO Treasury_data t
+            USING (SELECT 
+                    p_prices(i).ric AS ric,
+                    p_prices(i).timestamp AS timestamp,
+                    p_prices(i).bid_yield AS bid_yield,
+                    p_prices(i).ask_yield AS ask_yield,
+                    p_prices(i).bid_price AS bid_price,
+                    p_prices(i).ask_price AS ask_price,
+                    p_prices(i).update_type AS update_type,
+                    p_prices(i).last_update AS last_update
+                   FROM dual) s
+            ON (t.ric = s.ric)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    t.timestamp = s.timestamp,
+                    t.bid_yield = s.bid_yield,
+                    t.ask_yield = s.ask_yield,
+                    t.bid_price = s.bid_price,
+                    t.ask_price = s.ask_price,
+                    t.update_type = s.update_type,
+                    t.last_update = s.last_update
+            WHEN NOT MATCHED THEN
+                INSERT (ric, timestamp, bid_yield, ask_yield, bid_price, ask_price, update_type, last_update)
+                VALUES (s.ric, s.timestamp, s.bid_yield, s.ask_yield, s.bid_price, s.ask_price, s.update_type, s.last_update);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END load_treasury_prices;
+END treasury_feeds;
+/
+
+CREATE TABLE Treasury_data (
+    ric VARCHAR2(50) PRIMARY KEY,
+    timestamp TIMESTAMP,
+    bid_yield NUMBER(10,4),
+    ask_yield NUMBER(10,4),
+    bid_price NUMBER(10,4),
+    ask_price NUMBER(10,4),
+    update_type VARCHAR2(20),
+    last_update TIMESTAMP
+);
