@@ -6,10 +6,20 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.retry.annotation.EnableRetry;
 
+import javax.annotation.PostConstruct;
+import java.util.TimeZone;
+
 @SpringBootApplication
 @EnableScheduling
 @EnableRetry
 public class RefinitivTreasuryOmmApplication {
+
+    @PostConstruct
+    public void init() {
+        // Set default timezone to Asia/Kolkata (IST)
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Kolkata"));
+    }
+
     public static void main(String[] args) {
         SpringApplication.run(RefinitivTreasuryOmmApplication.class, args);
     }
@@ -18,7 +28,7 @@ public class RefinitivTreasuryOmmApplication {
 /* TreasuryData.java */
 package com.example.refinitivtreasury.entity;
 
-import jakarta.persistence.*;
+import javax.persistence.*;
 import java.time.LocalDateTime;
 
 @Entity
@@ -105,8 +115,8 @@ public class TreasuryPriceDto {
 package com.example.refinitivtreasury.repository;
 
 import com.example.refinitivtreasury.dto.TreasuryPriceDto;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
+import javax.persistence.EntityManager;
+import javax.persistence.PersistenceContext;
 import oracle.jdbc.OracleConnection;
 import oracle.sql.ARRAY;
 import oracle.sql.ArrayDescriptor;
@@ -162,9 +172,9 @@ public class TreasuryDataRepository {
             ARRAY array = new ARRAY(arrayDescriptor, oracleConnection, structs);
 
             String sql = "{call treasury_feeds.load_treasury_prices(?)}";
-            jakarta.persistence.StoredProcedureQuery query = entityManager
+            javax.persistence.StoredProcedureQuery query = entityManager
                 .createStoredProcedureQuery(sql)
-                .registerStoredProcedureParameter(1, Object.class, jakarta.persistence.ParameterMode.IN)
+                .registerStoredProcedureParameter(1, Object.class, javax.persistence.ParameterMode.IN)
                 .setParameter(1, array);
             query.execute();
             logger.info("Successfully upserted {} records to Treasury_data", prices.size());
@@ -186,10 +196,21 @@ package com.example.refinitivtreasury.service;
 
 import com.example.refinitivtreasury.dto.TreasuryPriceDto;
 import com.refinitiv.ema.access.*;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -197,6 +218,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class RefinitivOmmConsumer implements OmmConsumerClient {
@@ -204,25 +226,90 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
     private static final Logger logger = LoggerFactory.getLogger(RefinitivOmmConsumer.class);
     private static final int QUEUE_CAPACITY = 10000;
     private static final int RECONNECT_INTERVAL_MS = 5000;
+    private static final int DISPATCH_TIMEOUT_US = 1000; // 1ms
 
     private OmmConsumer consumer;
     private final BlockingQueue<TreasuryPriceDto> messageQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final List<Long> itemHandles = new ArrayList<>();
     private final Set<String> subscribedRics = ConcurrentHashMap.newKeySet();
+    private final Counter droppedMessagesCounter;
+    private final Counter dispatchedMessagesCounter;
+    private final Counter subscriptionCounter;
+    private final Timer offerLatencyTimer;
+    private final Timer pollLatencyTimer;
 
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    @Autowired
+    private ResourceLoader resourceLoader;
+
+    @Autowired
+    private Environment environment;
+
+    public RefinitivOmmConsumer(MeterRegistry meterRegistry, ResourceLoader resourceLoader, Environment environment) {
+        this.meterRegistry = meterRegistry;
+        this.resourceLoader = resourceLoader;
+        this.environment = environment;
+        this.droppedMessagesCounter = Counter.builder("queue.dropped.messages")
+            .description("Number of messages dropped due to queue being full")
+            .register(meterRegistry);
+        this.dispatchedMessagesCounter = Counter.builder("consumer.dispatched.messages")
+            .description("Number of messages dispatched by OmmConsumer")
+            .register(meterRegistry);
+        this.subscriptionCounter = Counter.builder("consumer.subscriptions")
+            .description("Number of active subscriptions")
+            .register(meterRegistry);
+        this.offerLatencyTimer = Timer.builder("queue.offer.latency")
+            .description("Latency of offer operations to message queue")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(meterRegistry);
+        this.pollLatencyTimer = Timer.builder("queue.poll.latency")
+            .description("Latency of poll operations from message queue")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(meterRegistry);
+        Gauge.builder("message.queue.size", messageQueue, BlockingQueue::size)
+            .description("Size of the TreasuryPriceDto message queue")
+            .register(meterRegistry);
+        Gauge.builder("consumer.subscriptions.active", subscribedRics, Set::size)
+            .description("Number of active RICs subscribed")
+            .register(meterRegistry);
+    }
+
+    @PostConstruct
     public void initialize() {
         int attempts = 0;
         while (consumer == null && attempts < 3) {
             try {
-                OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig()
-                        .host("your-refinitiv-host:14002")
-                        .username("your-username")
-                        .password("your-password");
+                // Load EmaConfig.xml from resources
+                Resource resource = resourceLoader.getResource("classpath:EmaConfig.xml");
+                if (!resource.exists()) {
+                    logger.error("EmaConfig.xml not found in resources");
+                    throw new RuntimeException("EmaConfig.xml not found");
+                }
+                String configXml = new String(Files.readAllBytes(resource.getFile().toPath()));
+                logger.debug("Loaded EmaConfig.xml: {}", configXml);
+
+                // Validate and replace host and port from application.properties
+                String host = environment.getProperty("refinitiv.host");
+                String port = environment.getProperty("refinitiv.port");
+                if (host == null || port == null) {
+                    logger.error("refinitiv.host or refinitiv.port not set in application.properties");
+                    throw new RuntimeException("Missing refinitiv.host or refinitiv.port");
+                }
+                // Replace placeholders in EmaConfig.xml
+                configXml = configXml.replace("${refinitiv.host}", host)
+                                    .replace("${refinitiv.port}", port);
+                logger.debug("Processed EmaConfig.xml with host={} and port={}", host, port);
+
+                // Initialize OmmConsumer with modified EmaConfig.xml
+                OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig();
+                config.config(EmaFactory.createDataBuffer(configXml.getBytes()));
                 consumer = EmaFactory.createOmmConsumer(config);
-                logger.info("OmmConsumer initialized successfully, host={}", "your-refinitiv-host:14002");
-            } catch (OmmException e) {
+                logger.info("OmmConsumer initialized successfully, host={}, port={}", host, port);
+            } catch (IOException | OmmException e) {
                 attempts++;
-                logger.error("Failed to initialize OmmConsumer, attempt={}/3, error_code={}", attempts, e.getErrorCode(), e);
+                logger.error("Failed to initialize OmmConsumer, attempt={}/3, error={}", attempts, e.getMessage(), e);
                 if (attempts < 3) {
                     try {
                         Thread.sleep(RECONNECT_INTERVAL_MS);
@@ -239,13 +326,30 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
         }
     }
 
+    @Scheduled(fixedRate = 1) // Run every 1ms
+    public void dispatchEvents() {
+        try {
+            if (consumer != null) {
+                consumer.dispatch(DISPATCH_TIMEOUT_US); // Dispatch events with 1ms timeout
+                dispatchedMessagesCounter.increment();
+                logger.debug("Dispatched events, queue_size={}", messageQueue.size());
+            } else {
+                logger.warn("OmmConsumer not initialized, skipping dispatch");
+            }
+        } catch (OmmException e) {
+            logger.error("Failed to dispatch events, error_code={}", e.getErrorCode(), e);
+        }
+    }
+
     public void subscribeToChain(String chainRic) {
         try {
             if (subscribedRics.add(chainRic)) {
                 long handle = consumer.registerClient(
                         EmaFactory.createReqMsg().serviceName("ELEKTRON_DD").name(chainRic), this);
                 itemHandles.add(handle);
-                logger.info("Subscribed to chain, ric={}, handle={}", chainRic, handle);
+                subscriptionCounter.increment();
+                logger.info("Subscribed to chain, ric={}, handle={}, active_subscriptions={}", 
+                    chainRic, handle, subscribedRics.size());
             } else {
                 logger.debug("Already subscribed to chain, ric={}", chainRic);
             }
@@ -259,6 +363,7 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
         for (Long handle : itemHandles) {
             try {
                 consumer.unregister(handle);
+                subscriptionCounter.increment(-1);
                 logger.info("Unsubscribed handle={}", handle);
             } catch (OmmException e) {
                 logger.error("Failed to unsubscribe, handle={}, error_code={}", handle, e.getErrorCode(), e);
@@ -282,13 +387,13 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
 
     @Override
     public void onRefreshMsg(RefreshMsg refreshMsg, OmmConsumerEvent event) {
-        logger.debug("Received refresh message, ric={}, domain={}", refreshMsg.name(), refreshMsg.domainType());
+        logger.info("Received refresh message, ric={}, domain={}", refreshMsg.name(), refreshMsg.domainType());
         processMessage(refreshMsg, "REFRESH");
     }
 
     @Override
     public void onUpdateMsg(UpdateMsg updateMsg, OmmConsumerEvent event) {
-        logger.debug("Received update message, ric={}, domain={}", updateMsg.name(), updateMsg.domainType());
+        logger.info("Received update message, ric={}, domain={}", updateMsg.name(), updateMsg.domainType());
         processMessage(updateMsg, "UPDATE");
     }
 
@@ -322,7 +427,6 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
 
         FieldList fieldList = msg.payload().fieldList();
         for (FieldEntry entry : fieldList) {
-            // Verify field IDs with your Refinitiv data dictionary
             switch (entry.fieldId()) {
                 case 22: // BID
                     dto.setBidPrice(entry.doubleValue());
@@ -344,9 +448,12 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
         }
 
         if (dto.getRic() != null && !dto.getRic().isEmpty()) {
+            long startTime = System.nanoTime();
             if (!messageQueue.offer(dto)) {
+                droppedMessagesCounter.increment();
                 logger.warn("Message queue full, dropping message, ric={}", dto.getRic());
             } else {
+                offerLatencyTimer.record(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
                 logger.debug("Queued TreasuryPriceDto, ric={}, queue_size={}", dto.getRic(), messageQueue.size());
             }
         } else {
@@ -366,7 +473,9 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
                             long handle = consumer.registerClient(
                                     EmaFactory.createReqMsg().serviceName("ELEKTRON_DD").name(ric), this);
                             itemHandles.add(handle);
-                            logger.info("Subscribed to chain constituent, ric={}, handle={}", ric, handle);
+                            subscriptionCounter.increment();
+                            logger.info("Subscribed to chain constituent, ric={}, handle={}, active_subscriptions={}", 
+                                ric, handle, subscribedRics.size());
                             count++;
                         } catch (OmmException e) {
                             logger.error("Failed to subscribe to chain constituent, ric={}, error_code={}", 
@@ -381,29 +490,47 @@ public class RefinitivOmmConsumer implements OmmConsumerClient {
     }
 
     public TreasuryPriceDto pollMessage() {
+        long startTime = System.nanoTime();
         TreasuryPriceDto dto = messageQueue.poll();
         if (dto != null) {
+            pollLatencyTimer.record(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
             logger.debug("Polled message, ric={}, queue_size={}", dto.getRic(), messageQueue.size());
         }
         return dto;
+    }
+
+    public int messageQueueSize() {
+        return messageQueue.size();
+    }
+
+    public int getActiveSubscriptions() {
+        return subscribedRics.size();
     }
 }
 
 /* LeaderElectionService.java */
 package com.example.refinitivtreasury.service;
 
+import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.curator.framework.state.ConnectionState;
+import org.apache.curator.framework.state.ConnectionStateListener;
+import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.util.UUID;
 
 @Service
+@RestController
 public class LeaderElectionService {
 
     private static final Logger logger = LoggerFactory.getLogger(LeaderElectionService.class);
@@ -415,11 +542,18 @@ public class LeaderElectionService {
 
     public LeaderElectionService() {
         this.nodeId = UUID.randomUUID().toString();
-        this.client = CuratorFrameworkFactory.newClient(
-            ZK_CONNECTION_STRING,
-            new ExponentialBackoffRetry(1000, 3)
-        );
+        RetryPolicy retryPolicy = new ExponentialBackoffRetry(1000, 3);
+        this.client = CuratorFrameworkFactory.newClient(ZK_CONNECTION_STRING, retryPolicy);
         this.leaderLatch = new LeaderLatch(client, LEADER_PATH, nodeId);
+        this.client.getConnectionStateListenable().addListener(new ConnectionStateListener() {
+            @Override
+            public void stateChanged(CuratorFramework client, ConnectionState newState) {
+                logger.info("ZooKeeper connection state changed, node_id={}, state={}", nodeId, newState);
+                if (newState == ConnectionState.LOST || newState == ConnectionState.SUSPENDED) {
+                    logger.warn("ZooKeeper connection issue detected, node_id={}, state={}", nodeId, newState);
+                }
+            }
+        });
     }
 
     @PostConstruct
@@ -427,12 +561,10 @@ public class LeaderElectionService {
         try {
             client.start();
             leaderLatch.start();
-            logger.info("Leader election initialized, node_id={}", nodeId);
-            if (leaderLatch.hasLeadership()) {
-                logger.info("Node elected as leader, node_id={}", nodeId);
-            }
+            logger.info("Leader election initialized, node_id={}, zk_connect={}", nodeId, ZK_CONNECTION_STRING);
+            logger.info("Initial leadership status, node_id={}, is_leader={}", nodeId, leaderLatch.hasLeadership());
         } catch (Exception e) {
-            logger.error("Failed to initialize leader election, node_id={}", nodeId, e);
+            logger.error("Failed to initialize leader election, node_id={}, error={}", nodeId, e.getMessage(), e);
             throw new RuntimeException("Leader election initialization failed", e);
         }
     }
@@ -444,7 +576,7 @@ public class LeaderElectionService {
             client.close();
             logger.info("Leader election shutdown, node_id={}", nodeId);
         } catch (Exception e) {
-            logger.error("Failed to shutdown leader election, node_id={}", nodeId, e);
+            logger.error("Failed to shutdown leader election, node_id={}, error={}", nodeId, e);
         }
     }
 
@@ -452,6 +584,23 @@ public class LeaderElectionService {
         boolean isLeader = leaderLatch.hasLeadership();
         logger.debug("Checked leadership status, node_id={}, is_leader={}", nodeId, isLeader);
         return isLeader;
+    }
+
+    @Scheduled(fixedRate = 5000) // Reduced to 5s for frequent checks
+    public void logLeadershipStatus() {
+        try {
+            logger.info("Periodic leadership check, node_id={}, is_leader={}, participants={}", 
+                nodeId, leaderLatch.hasLeadership(), leaderLatch.getParticipants().size());
+        } catch (Exception e) {
+            logger.error("Failed to check leadership status, node_id={}, error={}", nodeId, e.getMessage());
+        }
+    }
+
+    @GetMapping("/leadership-status")
+    public String getLeadershipStatus() {
+        boolean isLeader = leaderLatch.hasLeadership();
+        return String.format("Node ID: %s, Is Leader: %s, Participants: %d", 
+            nodeId, isLeader, leaderLatch.getParticipants().size());
     }
 }
 
@@ -462,15 +611,18 @@ import com.example.refinitivtreasury.dto.TreasuryPriceDto;
 import com.example.refinitivtreasury.repository.TreasuryDataRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Counter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RestController;
 
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -479,6 +631,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 @Service
+@RestController
 public class TreasuryDataService {
 
     private static final Logger logger = LoggerFactory.getLogger(TreasuryDataService.class);
@@ -497,14 +650,55 @@ public class TreasuryDataService {
 
     private final List<TreasuryPriceDto> batch = new ArrayList<>();
     private static final int BATCH_SIZE = 1000;
+    private final Counter startConsumerCounter;
+    private final Counter stopConsumerCounter;
+    private final Counter processMessagesCounter;
+    private final Counter flushBatchCounter;
+    private final Counter testSchedulerCounter;
+
+    public TreasuryDataService(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        this.startConsumerCounter = Counter.builder("scheduled.task.invocations")
+            .tag("method", "startConsumer")
+            .description("Invocations of startConsumer scheduled task")
+            .register(meterRegistry);
+        this.stopConsumerCounter = Counter.builder("scheduled.task.invocations")
+            .tag("method", "stopConsumer")
+            .description("Invocations of stopConsumer scheduled task")
+            .register(meterRegistry);
+        this.processMessagesCounter = Counter.builder("scheduled.task.invocations")
+            .tag("method", "processMessages")
+            .description("Invocations of processMessages scheduled task")
+            .register(meterRegistry);
+        this.flushBatchCounter = Counter.builder("scheduled.task.invocations")
+            .tag("method", "flushBatch")
+            .description("Invocations of flushBatch scheduled task")
+            .register(meterRegistry);
+        this.testSchedulerCounter = Counter.builder("scheduled.task.invocations")
+            .tag("method", "testScheduler")
+            .description("Invocations of testScheduler task")
+            .register(meterRegistry);
+    }
 
     @PostConstruct
     public void init() {
         ommConsumer.initialize();
-        Gauge.builder("message.queue.size", batch, List::size)
+        Gauge.builder("message.batch.size", batch, List::size)
              .description("Size of the TreasuryPriceDto batch queue")
              .register(meterRegistry);
         logger.info("TreasuryDataService initialized, batch_size_limit={}", BATCH_SIZE);
+        // Subscribe at startup if within operating hours and leader
+        boolean isOperating = isWithinOperatingHours();
+        boolean isLeader = leaderElectionService.isLeader();
+        if (isOperating && isLeader) {
+            ommConsumer.subscribeToChain("0#USTSY=");
+            logger.info("Subscribed to chain 0#USTSY= at startup, active_subscriptions={}", 
+                ommConsumer.getActiveSubscriptions());
+        } else {
+            logger.warn("Skipped startup subscription, is_leader={}, is_operating={}, time={}, day={}", 
+                isLeader, isOperating, LocalDateTime.now(ZoneId.of("Asia/Kolkata")), 
+                LocalDateTime.now(ZoneId.of("Asia/Kolkata")).getDayOfWeek());
+        }
     }
 
     @PreDestroy
@@ -523,33 +717,46 @@ public class TreasuryDataService {
         return isOperating;
     }
 
-    @Scheduled(cron = "0 0 3 * * MON-FRI", zone = "Asia/Kolkata")
+    @Scheduled(cron = "0 * 3-22 * * MON-FRI") // Every minute from 3 AM to 10 PM IST
     public void startConsumer() {
-        if (isWithinOperatingHours() && leaderElectionService.isLeader()) {
+        startConsumerCounter.increment();
+        logger.info("startConsumer scheduled task invoked, time={}", 
+            LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+        boolean isOperating = isWithinOperatingHours();
+        boolean isLeader = leaderElectionService.isLeader();
+        if (isOperating && isLeader) {
             ommConsumer.subscribeToChain("0#USTSY=");
-            logger.info("Started consumer for chain 0#USTSY=");
+            logger.info("Started consumer for chain 0#USTSY=, active_subscriptions={}", 
+                ommConsumer.getActiveSubscriptions());
         } else {
-            logger.debug("Skipped starting consumer, is_leader={}, is_operating={}", 
-                leaderElectionService.isLeader(), isWithinOperatingHours());
+            logger.debug("Skipped starting consumer, is_leader={}, is_operating={}, time={}, day={}", 
+                isLeader, isOperating, LocalDateTime.now(ZoneId.of("Asia/Kolkata")), 
+                LocalDateTime.now(ZoneId.of("Asia/Kolkata")).getDayOfWeek());
         }
     }
 
-    @Scheduled(cron = "0 0 23 * * MON-FRI", zone = "Asia/Kolkata")
+    @Scheduled(cron = "0 0 23 * * MON-FRI")
     public void stopConsumer() {
+        stopConsumerCounter.increment();
+        logger.info("stopConsumer scheduled task invoked, time={}", 
+            LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
         if (leaderElectionService.isLeader()) {
             ommConsumer.unsubscribeAll();
-            logger.info("Stopped consumer");
+            logger.info("Stopped consumer, active_subscriptions={}", ommConsumer.getActiveSubscriptions());
         } else {
             logger.debug("Skipped stopping consumer, is_leader={}", leaderElectionService.isLeader());
         }
     }
 
-    @Scheduled(fixedRate = 1000, scheduler = "messageProcessorExecutor")
+    @Scheduled(fixedRate = 1000)
     @Transactional
     public void processMessages() {
+        processMessagesCounter.increment();
+        logger.info("processMessages scheduled task invoked, is_leader={}, is_operating={}, queue_size={}", 
+            leaderElectionService.isLeader(), isWithinOperatingHours(), ommConsumer.messageQueueSize());
         if (!isWithinOperatingHours() || !leaderElectionService.isLeader()) {
-            logger.debug("Skipped message processing, is_leader={}, is_operating={}", 
-                leaderElectionService.isLeader(), isWithinOperatingHours());
+            logger.debug("Skipped message processing, is_leader={}, is_operating={}, queue_size={}", 
+                leaderElectionService.isLeader(), isWithinOperatingHours(), ommConsumer.messageQueueSize());
             return;
         }
 
@@ -566,16 +773,19 @@ public class TreasuryDataService {
                 batch.clear();
             }
         }
-        logger.debug("Processed {} messages, batch_size={}, duration_ms={}", 
-            processed, batch.size(), System.currentTimeMillis() - startTime);
+        logger.debug("Processed {} messages, batch_size={}, queue_size={}, duration_ms={}", 
+            processed, batch.size(), ommConsumer.messageQueueSize(), System.currentTimeMillis() - startTime);
     }
 
-    @Scheduled(fixedRate = 5000, scheduler = "messageProcessorExecutor")
+    @Scheduled(fixedRate = 25000)
     @Transactional
     public void flushBatch() {
+        flushBatchCounter.increment();
+        logger.info("flushBatch scheduled task invoked, is_leader={}, is_operating={}, batch_size={}", 
+            leaderElectionService.isLeader(), isWithinOperatingHours(), batch.size());
         if (!isWithinOperatingHours() || !leaderElectionService.isLeader() || batch.isEmpty()) {
-            logger.debug("Skipped batch flush, is_leader={}, is_operating={}, batch_size={}", 
-                leaderElectionService.isLeader(), isWithinOperatingHours(), batch.size());
+            logger.debug("Skipped batch flush, is_leader={}, is_operating={}, batch_size={}, queue_size={}", 
+                leaderElectionService.isLeader(), isWithinOperatingHours(), batch.size(), ommConsumer.messageQueueSize());
             return;
         }
         long startTime = System.currentTimeMillis();
@@ -584,26 +794,65 @@ public class TreasuryDataService {
             batch.size(), System.currentTimeMillis() - startTime);
         batch.clear();
     }
+
+    @Scheduled(fixedRate = 5000)
+    public void testScheduler() {
+        testSchedulerCounter.increment();
+        logger.info("testScheduler invoked, time={}", LocalDateTime.now(ZoneId.of("Asia/Kolkata")));
+    }
+
+    @PostMapping("/trigger-process-messages")
+    public String triggerProcessMessages() {
+        processMessages();
+        return "processMessages triggered";
+    }
+
+    @PostMapping("/trigger-flush-batch")
+    public String triggerFlushBatch() {
+        flushBatch();
+        return "flushBatch triggered";
+    }
+
+    @PostMapping("/trigger-start-consumer")
+    public String triggerStartConsumer() {
+        startConsumer();
+        return "startConsumer triggered";
+    }
 }
 
 /* ThreadPoolConfig.java */
 package com.example.refinitivtreasury.config;
 
-import org.springframework.context.annotation.Bean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.scheduling.annotation.SchedulingConfigurer;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.scheduling.config.ScheduledTaskRegistrar;
+import org.springframework.scheduling.support.ScheduledMethodRunnable;
 
 @Configuration
-public class ThreadPoolConfig {
-    @Bean(name = "messageProcessorExecutor")
-    public ThreadPoolTaskExecutor messageProcessorExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(4);
-        executor.setMaxPoolSize(8);
-        executor.setQueueCapacity(1000);
-        executor.setThreadNamePrefix("MessageProcessor-");
-        executor.initialize();
-        return executor;
+public class ThreadPoolConfig implements SchedulingConfigurer {
+
+    private static final Logger logger = LoggerFactory.getLogger(ThreadPoolConfig.class);
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar taskRegistrar) {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(6);
+        scheduler.setThreadNamePrefix("MessageProcessor-");
+        scheduler.initialize();
+        taskRegistrar.setTaskScheduler(scheduler);
+        taskRegistrar.afterPropertiesSet();
+        // Log scheduled tasks
+        for (Object task : taskRegistrar.getScheduledTasks()) {
+            if (task instanceof ScheduledMethodRunnable) {
+                ScheduledMethodRunnable runnable = (ScheduledMethodRunnable) task;
+                logger.info("Registered scheduled task: method={}, target={}", 
+                    runnable.getMethod().getName(), runnable.getTarget().getClass().getSimpleName());
+            }
+        }
+        logger.info("Total scheduled tasks: {}", taskRegistrar.getScheduledTasks().size());
     }
 }
 
@@ -617,7 +866,36 @@ spring.jpa.database-platform=org.hibernate.dialect.Oracle12cDialect
 spring.datasource.hikari.maximum-pool-size=10
 spring.datasource.hikari.minimum-idle=5
 management.endpoints.web.exposure.include=health,metrics,prometheus
+management.endpoints.web.base-path=/actuator
+management.endpoint.prometheus.enabled=true
+management.metrics.export.prometheus.enabled=true
+server.port=8095
 zookeeper.connect-string=localhost:2181
+refinitiv.host=your-refinitiv-host
+refinitiv.port=14002
+logging.level.org.springframework.scheduling=DEBUG
+logging.level.org.springframework.web=DEBUG
+logging.level.com.example.refinitivtreasury=DEBUG
+
+/* EmaConfig.xml */
+<?xml version="1.0" encoding="UTF-8"?>
+<EmaConfig>
+    <Consumer>
+        <Name value="Consumer_1"/>
+        <Channel value="Channel_1"/>
+    </Consumer>
+    <ChannelGroup>
+        <Channel>
+            <Name value="Channel_1"/>
+            <ChannelType value="ChannelType::RSSL_SOCKET"/>
+            <Host value="${refinitiv.host}"/>
+            <Port value="${refinitiv.port}"/>
+            <CompressionType value="CompressionType::None"/>
+            <GuaranteedOutputBuffers value="5000"/>
+            <ConnectionPingTimeout value="30000"/>
+        </Channel>
+    </ChannelGroup>
+</EmaConfig>
 
 /* pom.xml */
 <?xml version="1.0" encoding="UTF-8"?>
@@ -635,7 +913,7 @@ zookeeper.connect-string=localhost:2181
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.0</version>
+        <version>2.7.18</version>
         <relativePath/>
     </parent>
 
@@ -658,28 +936,32 @@ zookeeper.connect-string=localhost:2181
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>2.0.9</version>
+            <version>1.7.36</version>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
-            <version>1.4.11</version>
+            <version>1.2.13</version>
         </dependency>
         <dependency>
             <groupId>org.apache.curator</groupId>
             <artifactId>curator-recipes</artifactId>
-            <version>5.5.0</version>
+            <version>5.2.1</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.retry</groupId>
             <artifactId>spring-retry</artifactId>
-            <version>2.0.6</version>
+            <version>1.3.4</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
