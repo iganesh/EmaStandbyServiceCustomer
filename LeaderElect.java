@@ -1,3 +1,7 @@
+ava -Dhost.id=host1 -cp .:curator-dependencies.jar LeaderElectionExample
+java -Dhost.id=host2 -cp .:curator-dependencies.jar LeaderElectionExample
+
+    
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.recipes.leader.LeaderSelector;
