@@ -1,0 +1,258 @@
+import com.refinitiv.ema.access.*;
+import lombok.Data;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Repository;
+
+import javax.annotation.PostConstruct;
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.stream.Collectors;
+
+@SpringBootApplication
+@EnableScheduling
+public class PriceHedgeApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(PriceHedgeApplication.class, args);
+    }
+}
+
+@Configuration
+class AppConfig {
+    @Bean
+    public RefinitivDataClient refinitivDataClient(HedgeGlossaryRepository repository) {
+        return new RefinitivDataClient(repository);
+    }
+}
+
+@Component
+class MarketDataScheduler {
+    private final RefinitivDataClient refinitivDataClient;
+    private final HedgeGlossaryRepository repository;
+    private LocalTime marketStartTime;
+    private LocalTime marketEndTime;
+    private final JdbcTemplate jdbcTemplate;
+
+    public MarketDataScheduler(RefinitivDataClient refinitivDataClient, HedgeGlossaryRepository repository, JdbcTemplate jdbcTemplate) {
+        this.refinitivDataClient = refinitivDataClient;
+        this.repository = repository;
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    @PostConstruct
+    private void initializeMarketTimes() {
+        String sql = "SELECT key, value FROM lookuptable WHERE key IN ('MARKET_START', 'MARKET_END')";
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql);
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
+        for (Map<String, Object> row : results) {
+            String key = (String) row.get("key");
+            String value = (String) row.get("value");
+            if ("MARKET_START".equals(key)) {
+                marketStartTime = LocalTime.parse(value, formatter);
+            } else if ("MARKET_END".equals(key)) {
+                marketEndTime = LocalTime.parse(value, formatter);
+            }
+        }
+    }
+
+    @Scheduled(fixedRate = 30000) // Run every 30 seconds
+    public void fetchAndStoreMarketData() {
+        LocalTime now = LocalTime.now();
+        if (marketStartTime == null || marketEndTime == null || now.isBefore(marketStartTime) || now.isAfter(marketEndTime)) {
+            return; // Skip if outside market hours
+        }
+
+        // Fetch instruments from hedge_glossary
+        String sql = "SELECT DISTINCT hedge_code FROM hedge_glossary WHERE hedge_code IN ('US2YT=RR', 'US5YT=RR', 'O#TY#', '91282CNA5=')";
+        List<String> instruments = jdbcTemplate.queryForList(sql, String.class);
+        refinitivDataClient.subscribe(instruments);
+
+        // Process all items in the queue
+        refinitivDataClient.processQueue();
+    }
+}
+
+@Repository
+class HedgeGlossaryRepository {
+    private final JdbcTemplate jdbcTemplate;
+
+    public HedgeGlossaryRepository(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public void save(MarketData data) {
+        String sql = "MERGE INTO hedge_glossary dest " +
+                "USING (SELECT ? AS hedge_code, ? AS name, ? AS mipsticker, ? AS coupon, ? AS coupondate, " +
+                "? AS contractprice, ? AS tradetime, ? AS maturitydate, ? AS bidprice, ? AS askprice, ? AS yield FROM dual) src " +
+                "ON (dest.hedge_code = src.hedge_code AND dest.tradetime = src.tradetime) " +
+                "WHEN MATCHED THEN UPDATE SET " +
+                "dest.name = src.name, " +
+                "dest.mipsticker = src.mipsticker, " +
+                "dest.coupon = src.coupon, " +
+                "dest.coupondate = src.coupondate, " +
+                "dest.contractprice = src.contractprice, " +
+                "dest.maturitydate = src.maturitydate, " +
+                "dest.bidprice = src.bidprice, " +
+                "dest.askprice = src.askprice, " +
+                "dest.yield = src.yield " +
+                "WHEN NOT MATCHED THEN INSERT " +
+                "(hedge_code, name, mipsticker, coupon, coupondate, contractprice, tradetime, maturitydate, bidprice, askprice, yield) " +
+                "VALUES (src.hedge_code, src.name, src.mipsticker, src.coupon, src.coupondate, src.contractprice, src.tradetime, " +
+                "src.maturitydate, src.bidprice, src.askprice, src.yield)";
+
+        jdbcTemplate.update(sql,
+                data.getHedgeCode(),
+                data.getName(),
+                data.getMipsTicker(),
+                data.getCoupon(),
+                data.getCouponDate() != null ? Timestamp.valueOf(data.getCouponDate().atStartOfDay()) : null,
+                data.getContractPrice(),
+                data.getTradeTime(),
+                data.getMaturityDate() != null ? Timestamp.valueOf(data.getMaturityDate().atStartOfDay()) : null,
+                data.getBidPrice(),
+                data.getAskPrice(),
+                data.getYield());
+    }
+}
+
+@Data
+class MarketData {
+    private String hedgeCode;
+    private String name;
+    private String mipsTicker;
+    private BigDecimal coupon;
+    private LocalDate couponDate;
+    private BigDecimal contractPrice;
+    private Timestamp tradeTime;
+    private LocalDate maturityDate;
+    private BigDecimal bidPrice;
+    private BigDecimal askPrice;
+    private BigDecimal yield;
+}
+
+class RefinitivDataClient implements OmmConsumerClient {
+    private OmmConsumer consumer;
+    private final HedgeGlossaryRepository repository;
+    private final ConcurrentLinkedQueue<MarketData> marketDataQueue = new ConcurrentLinkedQueue<>();
+    private final Map<String, Boolean> subscribedInstruments = new ConcurrentHashMap<>();
+
+    public RefinitivDataClient(HedgeGlossaryRepository repository) {
+        this.repository = repository;
+        initializeConsumer();
+    }
+
+    private void initializeConsumer() {
+        try {
+            OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig()
+                    .host(System.getProperty("refinitiv.host", "localhost:14002"))
+                    .username(System.getProperty("refinitiv.user", "your_username"));
+            consumer = EmaFactory.createOmmConsumer(config);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize OmmConsumer", e);
+        }
+    }
+
+    public void subscribe(List<String> instruments) {
+        for (String instrument : instruments) {
+            if (!subscribedInstruments.containsKey(instrument)) {
+                consumer.registerClient(EmaFactory.createReqMsg()
+                        .serviceName(System.getProperty("refinitiv.service", "ELEKTRON_DD"))
+                        .name(instrument), this);
+                subscribedInstruments.put(instrument, true);
+            }
+        }
+    }
+
+    public void processQueue() {
+        MarketData data;
+        while ((data = marketDataQueue.poll()) != null) {
+            repository.save(data);
+        }
+    }
+
+    @Override
+    public void onRefreshMsg(RefreshMsg refreshMsg, OmmConsumerEvent event) {
+        handleMarketData(refreshMsg);
+    }
+
+    @Override
+    public void onUpdateMsg(UpdateMsg updateMsg, OmmConsumerEvent event) {
+        handleMarketData(updateMsg);
+    }
+
+    @Override
+    public void onStatusMsg(StatusMsg statusMsg, OmmConsumerEvent event) {
+        // Handle status messages if needed
+    }
+
+    private void handleMarketData(Msg msg) {
+        if (msg.hasName()) {
+            MarketData data = new MarketData();
+            data.setHedgeCode(msg.name());
+            data.setName("Treasury " + msg.name());
+            data.setMipsTicker(msg.name());
+            data.setTradeTime(new Timestamp(System.currentTimeMillis()));
+
+            // Extract fields from payload (example fields, adjust based on actual FID mappings)
+            if (msg.payload().fieldList() != null) {
+                FieldList fieldList = msg.payload().fieldList();
+                for (FieldEntry entry : fieldList) {
+                    switch (entry.fieldId()) {
+                        case 22: // BID
+                            data.setBidPrice(new BigDecimal(entry.real().asDouble()));
+                            break;
+                        case 25: // ASK
+                            data.setAskPrice(new BigDecimal(entry.real().asDouble()));
+                            break;
+                        case 32: // TRDPRC_1 (Trade Price)
+                            data.setContractPrice(new BigDecimal(entry.real().asDouble()));
+                            break;
+                        case 1021: // COUPON
+                            data.setCoupon(new BigDecimal(entry.real().asDouble()));
+                            break;
+                        case 991: // MATUR_DATE
+                            data.setMaturityDate(parseDate(entry.rmtes().toString()));
+                            break;
+                        case 259: // COUPON_DATE
+                            data.setCouponDate(parseDate(entry.rmtes().toString()));
+                            break;
+                        case 393: // YIELD
+                            data.setYield(new BigDecimal(entry.real().asDouble()));
+                            break;
+                    }
+                }
+            }
+
+            marketDataQueue.add(data);
+        }
+    }
+
+    private LocalDate parseDate(String dateStr) {
+        try {
+            return LocalDate.parse(dateStr, DateTimeFormatter.ISO_LOCAL_DATE);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // Implement other OmmConsumerClient methods
+    @Override
+    public void onGenericMsg(GenericMsg genericMsg, OmmConsumerEvent event) {}
+    @Override
+    public void onAckMsg(AckMsg ackMsg, OmmConsumerEvent event) {}
+    @Override
+    public void onAllMsg(Msg msg, OmmConsumerEvent event) {}
+}
