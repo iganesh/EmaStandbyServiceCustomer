@@ -1,0 +1,193 @@
+Refinitiv Treasury OMM Application
+Overview
+This Spring Boot application consumes real-time U.S. Treasury market data (e.g., US2YT=RR) from Refinitiv’s Elektron Message API (EMA) using the chain RIC 0#USTSY=. It processes bid/ask prices and yields, stores them in an Oracle database, and uses ZooKeeper for leader election to ensure only one node processes data. The application operates Monday to Friday, 3 AM–11 PM IST, and sends email notifications for exceptions. Metrics are exposed via Micrometer and Prometheus for monitoring.
+Features
+
+Subscribes to Refinitiv chain RIC 0#USTSY= and processes constituent RICs (e.g., US2YT=RR).
+Handles market price messages (BID, ASK, YLD_1, ASK_YLD) using ArrayBlockingQueue (capacity: 10,000).
+Batches and upserts data to Oracle (batch size: 1000) with retry logic.
+Leader election via ZooKeeper ensures single-node processing.
+Sends exception emails using JavaMailSender (e.g., Gmail SMTP).
+Exposes metrics (/actuator/prometheus) for queue size, subscriptions, and latency.
+Runs on port 8095 with Asia/Kolkata timezone.
+
+Prerequisites
+
+Java: 17 or higher
+Maven: 3.8.0 or higher
+Oracle Database: 12c or higher with TREASURY_PRICE_T and TREASURY_PRICE_TAB types, and treasury_feeds.load_treasury_prices procedure.
+ZooKeeper: 3.7.0 or higher
+Refinitiv EMA: SDK for market data access
+SMTP Server: Gmail or another provider for email notifications
+Dependencies: Listed in pom.xml (e.g., Spring Boot, Oracle JDBC, Curator, Micrometer, JavaMail)
+
+Setup
+
+Clone the Repository:
+git clone <repository-url>
+cd refinitiv-treasury-omm
+
+
+Configure Application Properties:Edit src/main/resources/application.properties:
+spring.datasource.url=jdbc:oracle:thin:@localhost:1521:ORCL
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+refinitiv.host=your-refinitiv-host
+refinitiv.port=14002
+spring.mail.host=smtp.gmail.com
+spring.mail.port=587
+spring.mail.username=your-email@gmail.com
+spring.mail.password=your-app-specific-password
+app.error.email.to=recipient@example.com
+zookeeper.connect-string=localhost:2181
+
+
+Generate a Gmail app-specific password: Google Account > Security > 2-Step Verification > App passwords.
+Ensure EmaConfig.xml is in src/main/resources with correct host/port placeholders.
+
+
+Set Up Oracle Database:Execute oracle_types_and_procedure.sql to create types and stored procedure:
+CREATE OR REPLACE TYPE TREASURY_PRICE_T AS OBJECT (
+    ric VARCHAR2(50),
+    timestamp TIMESTAMP,
+    bid_yield NUMBER,
+    ask_yield NUMBER,
+    bid_price NUMBER,
+    ask_price NUMBER,
+    update_type VARCHAR2(20),
+    last_update TIMESTAMP
+);
+/
+CREATE OR REPLACE TYPE TREASURY_PRICE_TAB AS TABLE OF TREASURY_PRICE_T;
+/
+CREATE OR REPLACE PACKAGE treasury_feeds AS
+    PROCEDURE load_treasury_prices(p_prices IN TREASURY_PRICE_TAB);
+END treasury_feeds;
+/
+CREATE OR REPLACE PACKAGE BODY treasury_feeds AS
+    PROCEDURE load_treasury_prices(p_prices IN TREASURY_PRICE_TAB) IS
+    BEGIN
+        FORALL i IN 1..p_prices.COUNT
+            INSERT INTO Treasury_data (ric, timestamp, bid_yield, ask_yield, bid_price, ask_price, update_type, last_update)
+            VALUES (
+                p_prices(i).ric,
+                p_prices(i).timestamp,
+                p_prices(i).bid_yield,
+                p_prices(i).ask_yield,
+                p_prices(i).bid_price,
+                p_prices(i).ask_price,
+                p_prices(i).update_type,
+                p_prices(i).last_update
+            );
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            RAISE;
+    END load_treasury_prices;
+END treasury_feeds;
+/
+
+
+Start ZooKeeper:
+zkServer.sh start
+
+
+Install Dependencies:
+mvn clean install
+
+
+
+Running the Application
+
+Start the Application:
+mvn spring-boot:run
+
+
+The application starts on http://localhost:8095.
+If the node is the leader and within operating hours (3 AM–11 PM IST, Mon–Fri), it subscribes to 0#USTSY= and processes RICs like US2YT=RR.
+
+
+Manual Triggers:
+
+Start consumer: curl -X POST http://localhost:8095/trigger-start-consumer
+Process messages: curl -X POST http://localhost:8095/trigger-process-messages
+Flush batch: curl -X POST http://localhost:8095/trigger-flush-batch
+Check leadership: curl http://localhost:8095/leadership-status
+
+
+
+Testing
+
+Run Unit Tests:
+mvn clean test
+
+
+Tests in RefinitivTreasuryOmmApplicationTests.java cover RefinitivOmmConsumer, TreasuryDataService, LeaderElectionService, TreasuryDataRepository, and ExceptionEmailService.
+Achieves 100% line/branch coverage (JaCoCo report in target/jacoco-report).
+
+
+Verify US2YT=RR Processing:
+
+Check logs for:Subscribed to chain constituent, ric=US2YT=RR, handle=..., active_subscriptions=...
+Queued TreasuryPriceDto, ric=US2YT=RR, queue_size=...
+Processed batch, size=..., duration_ms=...
+
+
+Query Oracle:SELECT * FROM Treasury_data WHERE ric = 'US2YT=RR';
+
+
+
+
+
+Monitoring
+
+Actuator Endpoints:
+
+Health: curl http://localhost:8095/actuator/health
+Metrics: curl http://localhost:8095/actuator/prometheus
+Key metrics:
+message_queue_size: Current queue size.
+consumer_subscriptions_active: Number of subscribed RICs (e.g., US2YT=RR).
+queue_dropped_messages_total: Dropped messages due to full queue.
+queue_offer_latency_seconds: Latency for queue offer operations.
+scheduled_task_invocations_total: Task invocation counts (e.g., startConsumer, processMessages).
+
+
+
+
+Logs:
+
+Located in console or configured log file (e.g., application.log).
+Set logging.level.com.example.refinitivtreasury=DEBUG for detailed logs.
+
+
+
+Troubleshooting
+
+No Data Processed:
+Verify node is leader: curl http://localhost:8095/leadership-status.
+Check operating hours (3 AM–11 PM IST, Mon–Fri).
+Ensure refinitiv.host and refinitiv.port are correct in application.properties.
+
+
+Email Notification Issues:
+Verify SMTP settings and app-specific password.
+Check logs for Failed to send exception email.
+
+
+Database Errors:
+Ensure Oracle types and procedure are created.
+Check SQLException in logs and email reports.
+
+
+ZooKeeper Issues:
+Verify ZooKeeper is running: zkServer.sh status.
+Check zookeeper.connect-string.
+
+
+
+Architecture
+See Architecture Diagram for component interactions and Process Flow for data processing steps.
+License
+Proprietary. Contact the project owner for licensing details.
