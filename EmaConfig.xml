@@ -1,0 +1,167 @@
+The user is asking about configuring failover (switchover from primary to secondary host) in a Spring Boot application using the LSEG (Refinitiv) Real-Time SDK EMA Java with EmaConfig.xml. Based on the EMA documentation and examples, this is handled via the Warm Standby feature, which allows automatic failover without manual intervention in code—the SDK manages it transparently once configured. You define multiple channels (e.g., "Channel1" for primary host, "Channel" for secondary), group them into a WarmStandbyChannel, and assign to your consumer. Failover triggers on connection loss or service down events.
+
+I'll assume "Channel" is a secondary channel (perhaps a typo for "Channel2"). Use SERVICE_BASED mode for better resiliency (recommended over LOGIN_BASED, as it handles service failures even if the connection persists).
+
+### Step 1: Configure EmaConfig.xml for Warm Standby
+Place EmaConfig.xml in your classpath (e.g., src/main/resources). Here's a complete example tailored to your setup with separate hosts:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<EmaConfig>
+    <ConsumerGroup>
+        <DefaultConsumer value="Consumer_1"/>
+        <ConsumerList>
+            <Consumer>
+                <Name value="Consumer_1"/>
+                <WarmStandbyChannelSet value="WarmStandbyChannel_1"/>  <!-- Assign warm standby group -->
+                <Logger value="Logger_1"/>
+                <Dictionary value="Dictionary_1"/>
+            </Consumer>
+        </ConsumerList>
+    </ConsumerGroup>
+    <ChannelGroup>
+        <ChannelList>
+            <Channel>
+                <Name value="Channel1"/>  <!-- Primary channel -->
+                <ChannelType value="ChannelType::RSSL_SOCKET"/>
+                <CompressionType value="CompressionType::None"/>
+                <GuaranteedOutputBuffers value="5000"/>
+                <Host value="primary-host.example.com"/>  <!-- Your primary host -->
+                <Port value="14002"/>  <!-- Standard port; adjust as needed -->
+                <ObjectName value=""/>
+            </Channel>
+            <Channel>
+                <Name value="Channel"/>  <!-- Secondary channel -->
+                <ChannelType value="ChannelType::RSSL_SOCKET"/>
+                <CompressionType value="CompressionType::None"/>
+                <GuaranteedOutputBuffers value="5000"/>
+                <Host value="secondary-host.example.com"/>  <!-- Your secondary host -->
+                <Port value="14002"/>
+                <ObjectName value=""/>
+            </Channel>
+        </ChannelList>
+    </ChannelGroup>
+    <WarmStandbyServerInfoGroup>
+        <WarmStandbyServerInfoList>
+            <WarmStandbyServerInfo>
+                <Name value="Server_Info_1"/>
+                <Channel value="Channel1"/>  <!-- Link to primary -->
+                <PerServiceNameSet value="DIRECT_FEED"/>  <!-- Your service name, e.g., for Treasury/FutureOptions -->
+            </WarmStandbyServerInfo>
+            <WarmStandbyServerInfo>
+                <Name value="Server_Info_2"/>
+                <Channel value="Channel"/>  <!-- Link to secondary -->
+                <PerServiceNameSet value="DIRECT_FEED"/>
+            </WarmStandbyServerInfo>
+        </WarmStandbyServerInfoList>
+    </WarmStandbyServerInfoGroup>
+    <WarmStandbyGroup>
+        <WarmStandbyList>
+            <WarmStandbyChannel>
+                <Name value="WarmStandbyChannel_1"/>
+                <StartingActiveServer value="Server_Info_1"/>  <!-- Primary starts active -->
+                <StandbyServerSet value="Server_Info_2"/>  <!-- Secondary as standby -->
+                <WarmStandbyMode value="WarmStandbyMode::SERVICE_BASED"/>  <!-- Or LOGIN_BASED; service-based is recommended -->
+            </WarmStandbyChannel>
+        </WarmStandbyList>
+    </WarmStandbyGroup>
+    <LoggerGroup>
+        <LoggerList>
+            <Logger>
+                <Name value="Logger_1"/>
+                <LoggerType value="LoggerType::Stdout"/>
+                <LoggerSeverity value="LoggerSeverity::Verbose"/>  <!-- For debugging failover -->
+            </Logger>
+        </LoggerList>
+    </LoggerGroup>
+    <DictionaryGroup>
+        <DictionaryList>
+            <Dictionary>
+                <Name value="Dictionary_1"/>
+                <DictionaryType value="DictionaryType::FileDictionary"/>  <!-- Or ChannelDictionary -->
+                <RdmFieldDictionaryFileName value="config/RDMFieldDictionary"/>
+                <EnumTypeDefFileName value="config/enumtype.def"/>
+            </Dictionary>
+        </DictionaryList>
+    </DictionaryGroup>
+</EmaConfig>
+```
+
+- **Key Notes**:
+  - EMA establishes connections to both hosts simultaneously.
+  - Items (e.g., RICs) are subscribed to all servers; active sends data, standby sends empty refreshes.
+  - On failure (e.g., primary down), EMA notifies the standby to become active and resumes streaming without re-subscribing.
+  - Ensure your ADS (or provider) supports Warm Standby (set `*ads*supportWarmStandby : True` in ADS config).
+  - Adjust hosts, ports, service names (e.g., "DIRECT_FEED" or "ELEKTRON_DD"), and dictionary paths as per your setup.
+
+### Step 2: Load Config and Create OmmConsumer in Code
+In your Spring Boot service or component (e.g., a @Bean), load the XML and create the consumer. Failover is automatic—no explicit switch code needed.
+
+```java
+import com.refinitiv.ema.access.EmaFactory;
+import com.refinitiv.ema.access.OmmConsumer;
+import com.refinitiv.ema.access.OmmConsumerConfig;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class EmaConfig {
+
+    @Bean
+    public OmmConsumer ommConsumer(AppClient appClient) {  // AppClient is your OmmConsumerClient impl
+        OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig()
+            .configFile("EmaConfig.xml");  // Loads from classpath
+        return EmaFactory.createOmmConsumer(config);
+    }
+}
+```
+
+### Step 3: Handle Errors and Monitor Failover in Code
+While failover is SDK-managed, implement callbacks in your `AppClient` (which extends `OmmConsumerClient`) to detect and log errors/switchovers. This is where you "handle" it (e.g., retry logic if needed, though usually not).
+
+```java
+import com.refinitiv.ema.access.*;
+
+public class AppClient implements OmmConsumerClient {
+
+    @Override
+    public void onRefreshMsg(RefreshMsg refreshMsg, OmmConsumerEvent event) {
+        // Handle refresh as usual
+    }
+
+    @Override
+    public void onUpdateMsg(UpdateMsg updateMsg, OmmConsumerEvent event) {
+        // Handle updates as usual
+    }
+
+    @Override
+    public void onStatusMsg(StatusMsg statusMsg, OmmConsumerEvent event) {
+        System.out.println("Status: " + statusMsg.state().toString() + " for item: " + statusMsg.name());
+        
+        // Detect failover or errors
+        if (statusMsg.state().dataState() == OmmState.DataStates.SUSPECT) {
+            System.out.println("Connection or service suspect/down: " + statusMsg.state().text());
+            // Optional: Custom logic, e.g., alert or pause subscriptions
+        } else if (statusMsg.state().streamState() == OmmState.StreamStates.CLOSED_RECOVER) {
+            System.out.println("Recoverable failure - EMA will attempt failover");
+            // EMA auto-handles switch to secondary
+        } else if (statusMsg.state().streamState() == OmmState.StreamStates.OPEN && statusMsg.state().dataState() == OmmState.DataStates.OK) {
+            System.out.println("Stream open/OK - Possible successful failover");
+        }
+    }
+
+    // Implement other methods (onGenericMsg, etc.) as needed
+}
+```
+
+- Register your client: `consumer.registerClient(reqMsg, appClient);`
+- In onStatusMsg, check states like SUSPECT (potential failover trigger) or CLOSED_RECOVER (recovery in progress).
+- For deeper monitoring, enable verbose logging in EmaConfig.xml to see failover events (e.g., "Switching to standby server").
+
+### Additional Tips
+- **Testing**: Simulate failure by stopping the primary ADS/host and verify updates continue from secondary via logs.
+- **Programmatic Alternative**: If avoiding XML, use code to build the config (e.g., `config.warmStandbyChannelSet("WarmStandbyChannel_1")`), but XML is simpler for complex setups.
+- **Requirements**: RT-SDK Java >= 2.0.7.L1. Ensure both hosts have identical services/RICs.
+- If errors persist (e.g., config load fails), check logs for details and ensure XML is valid.
+
+If you share your current EmaConfig.xml or error logs, I can refine this further!
