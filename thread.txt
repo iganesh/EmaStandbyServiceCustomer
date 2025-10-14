@@ -1,0 +1,421 @@
+/* RefinitivTreasuryOmmApplication.java */
+package com.example.refinitivtreasury;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.retry.annotation.EnableRetry;
+
+@SpringBootApplication
+@EnableScheduling
+@EnableRetry
+public class RefinitivTreasuryOmmApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RefinitivTreasuryOmmApplication.class, args);
+    }
+}
+
+/* TreasuryData.java */
+package com.example.refinitivtreasury.entity;
+
+import javax.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "Treasury_data")
+public class TreasuryData {
+
+    @Id
+    @Column(name = "ric")
+    private String ric;
+
+    @Column(name = "timestamp")
+    private LocalDateTime timestamp;
+
+    @Column(name = "bid_yield")
+    private Double bidYield;
+
+    @Column(name = "ask_yield")
+    private Double askYield;
+
+    @Column(name = "bid_price")
+    private Double bidPrice;
+
+    @Column(name = "ask_price")
+    private Double askPrice;
+
+    @Column(name = "update_type")
+    private String updateType;
+
+    @Column(name = "last_update")
+    private LocalDateTime lastUpdate;
+
+    public String getRic() { return ric; }
+    public void setRic(String ric) { this.ric = ric; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+    public void setTimestamp(LocalDateTime timestamp) { this.timestamp = timestamp; }
+    public Double getBidYield() { return bidYield; }
+    public void setBidYield(Double bidYield) { this.bidYield = bidYield; }
+    public Double getAskYield() { return askYield; }
+    public void setAskYield(Double askYield) { this.askYield = askYield; }
+    public Double getBidPrice() { return bidPrice; }
+    public void setBidPrice(Double bidPrice) { this.bidPrice = bidPrice; }
+    public Double getAskPrice() { return askPrice; }
+    public void setAskPrice(Double askPrice) { this.askPrice = askPrice; }
+    public String getUpdateType() { return updateType; }
+    public void setUpdateType(String updateType) { this.updateType = updateType; }
+    public LocalDateTime getLastUpdate() { return lastUpdate; }
+    public void setLastUpdate(LocalDateTime lastUpdate) { this.lastUpdate = lastUpdate; }
+}
+
+/* TreasuryPriceDto.java */
+package com.example.refinitivtreasury.dto;
+
+import java.time.LocalDateTime;
+
+public class TreasuryPriceDto {
+    private String ric;
+    private LocalDateTime timestamp;
+    private Double bidYield;
+    private Double askYield;
+    private Double bidPrice;
+    private Double askPrice;
+    private String updateType;
+    private LocalDateTime lastUpdate;
+
+    public String getRic() { return ric; }
+    public void setRic(String ric) { this.ric = ric; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+    public void setTimestamp(LocalDateTime timestamp) { this.timestamp = timestamp; }
+    public Double getBidYield() { return bidYield; }
+    public void setBidYield(Double bidYield) { this.bidYield = bidYield; }
+    public Double getAskYield() { return askYield; }
+    public void setAskYield(Double askYield) { this.askYield = askYield; }
+    public Double getBidPrice() { return bidPrice; }
+    public void setBidPrice(Double bidPrice) { this.bidPrice = bidPrice; }
+    public Double getAskPrice() { return askPrice; }
+    public void setAskPrice(Double askPrice) { this.askPrice = askPrice; }
+    public String getUpdateType() { return updateType; }
+    public void setUpdateType(String updateType) { this.updateType = updateType; }
+    public LocalDateTime getLastUpdate() { return lastUpdate; }
+    public void setLastUpdate(LocalDateTime lastUpdate) { this.lastUpdate = lastUpdate; }
+}
+
+/* TreasuryDataRepository.java */
+package com.example.refinitivtreasury.repository;
+
+import com.example.refinitivtreasury.dto.TreasuryPriceDto;
+import javax.persistence.EntityManager;
+import javax.persistence.PersistenceContext;
+import oracle.jdbc.OracleConnection;
+import oracle.sql.ARRAY;
+import oracle.sql.ArrayDescriptor;
+import oracle.sql.STRUCT;
+import oracle.sql.StructDescriptor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.List;
+
+@Repository
+public class TreasuryDataRepository {
+
+    private static final Logger logger = LoggerFactory.getLogger(TreasuryDataRepository.class);
+
+    @PersistenceContext
+    private EntityManager entityManager;
+
+    @Retryable(
+        value = { SQLException.class },
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 500, maxDelay = 2000, multiplier = 2)
+    )
+    @Transactional
+    public void upsert(List<TreasuryPriceDto> prices) {
+        logger.info("Attempting to upsert {} TreasuryPriceDto records", prices.size());
+        try {
+            OracleConnection oracleConnection = entityManager.unwrap(OracleConnection.class);
+            StructDescriptor structDescriptor = StructDescriptor.createDescriptor("TREASURY_PRICE_T", oracleConnection);
+            ArrayDescriptor arrayDescriptor = ArrayDescriptor.createDescriptor("TREASURY_PRICE_TAB", oracleConnection);
+
+            STRUCT[] structs = new STRUCT[prices.size()];
+            for (int i = 0; i < prices.size(); i++) {
+                TreasuryPriceDto price = prices.get(i);
+                Object[] fields = new Object[]{
+                    price.getRic(),
+                    price.getTimestamp() != null ? Timestamp.valueOf(price.getTimestamp()) : null,
+                    price.getBidYield(),
+                    price.getAskYield(),
+                    price.getBidPrice(),
+                    price.getAskPrice(),
+                    price.getUpdateType(),
+                    price.getLastUpdate() != null ? Timestamp.valueOf(price.getLastUpdate()) : null
+                };
+                structs[i] = new STRUCT(structDescriptor, oracleConnection, fields);
+            }
+            ARRAY array = new ARRAY(arrayDescriptor, oracleConnection, structs);
+
+            String sql = "{call treasury_feeds.load_treasury_prices(?)}";
+            javax.persistence.StoredProcedureQuery query = entityManager
+                .createStoredProcedureQuery(sql)
+                .registerStoredProcedureParameter(1, Object.class, javax.persistence.ParameterMode.IN)
+                .setParameter(1, array);
+            query.execute();
+            logger.info("Successfully upserted {} records to Treasury_data", prices.size());
+        } catch (SQLException e) {
+            logger.error("Failed to upsert {} records: error_code={}, sql_state={}", 
+                prices.size(), e.getErrorCode(), e.getSQLState(), e);
+            throw new RuntimeException("Failed to call stored procedure", e);
+        }
+    }
+
+    public void upsertFallback(List<TreasuryPriceDto> prices, Exception e) {
+        logger.error("Failed to upsert {} records after retries: error={}", prices.size(), e.getMessage());
+    }
+}
+
+/* RefinitivOmmConsumer.java */
+package com.example.refinitivtreasury.service;
+
+import com.example.refinitivtreasury.dto.TreasuryPriceDto;
+import com.refinitiv.ema.access.*;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class RefinitivOmmConsumer {
+
+    private static final Logger logger = LoggerFactory.getLogger(RefinitivOmmConsumer.class);
+    private final BlockingQueue<TreasuryPriceDto> messageQueue = new ArrayBlockingQueue<>(10000);
+    private ExecutorService executorService;
+    private final ResourceLoader resourceLoader;
+    private final Environment environment;
+    private final MeterRegistry meterRegistry;
+    private final ExceptionEmailService exceptionEmailService;
+
+    @Autowired
+    public RefinitivOmmConsumer(ResourceLoader resourceLoader, Environment environment, MeterRegistry meterRegistry, ExceptionEmailService exceptionEmailService) {
+        this.resourceLoader = resourceLoader;
+        this.environment = environment;
+        this.meterRegistry = meterRegistry;
+        this.exceptionEmailService = exceptionEmailService;
+    }
+
+    @PostConstruct
+    public void initialize() {
+        executorService = Executors.newFixedThreadPool(2);
+        logger.info("RefinitivOmmConsumer initialized with ExecutorService for 2 threads");
+    }
+
+    public void startConsumers() {
+        try {
+            executorService.submit(() -> {
+                OmmConsumer consumer = createOmmConsumer();
+                if (consumer != null) {
+                    subscribeAndProcess(consumer, "US2YT=RR");
+                }
+            });
+            executorService.submit(() -> {
+                OmmConsumer consumer = createOmmConsumer();
+                if (consumer != null) {
+                    subscribeAndProcess(consumer, "US5YT=RR");
+                }
+            });
+            logger.info("Started consumers using ExecutorService for US2YT=RR and US5YT=RR");
+        } catch (Exception e) {
+            logger.error("Failed to start consumers, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.startConsumers");
+        }
+    }
+
+    private OmmConsumer createOmmConsumer() {
+        try {
+            String configXml = Files.readString(resourceLoader.getResource("classpath:EmaConfig.xml").getFile().toPath());
+            String host = environment.getProperty("refinitiv.host");
+            String port = environment.getProperty("refinitiv.port");
+            if (host == null || port == null) {
+                throw new IllegalArgumentException("refinitiv.host or refinitiv.port is missing");
+            }
+            configXml = configXml.replace("${HOST}", host).replace("${PORT}", port);
+            OmmConsumerConfig config = EmaFactory.createOmmConsumerConfig();
+            config.config(ByteBuffer.wrap(configXml.getBytes()));
+            return EmaFactory.createOmmConsumer(config);
+        } catch (IOException | OmmException e) {
+            logger.error("Failed to create OmmConsumer, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.createOmmConsumer");
+            return null;
+        }
+    }
+
+    private void subscribeAndProcess(OmmConsumer consumer, String ric) {
+        try {
+            long handle = consumer.registerClient(EmaFactory.createReqMsg().name(ric).serviceName("ELEKTRON_DD"), this);
+            logger.info("Subscribed to RIC {} with handle={}", ric, handle);
+            while (!Thread.currentThread().isInterrupted()) {
+                consumer.dispatch(1000); // Dispatch with 1ms timeout
+                Thread.sleep(1);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.info("Processing for RIC {} interrupted", ric);
+        } catch (OmmException e) {
+            logger.error("Failed to subscribe/process RIC {}, error={}", ric, e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.subscribeAndProcess-" + ric);
+        } finally {
+            if (consumer != null) {
+                consumer.uninitialize();
+                logger.info("Uninitialized consumer for RIC {}", ric);
+            }
+        }
+    }
+
+    public void unsubscribeAll() {
+        try {
+            executorService.shutdownNow();
+            executorService.awaitTermination(10, TimeUnit.SECONDS);
+            logger.info("Unsubscribed all, shutdown ExecutorService");
+        } catch (InterruptedException e) {
+            logger.error("Interrupted while shutting down ExecutorService, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.unsubscribeAll");
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            logger.error("Failed to unsubscribe all, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.unsubscribeAll");
+        }
+    }
+
+    public TreasuryPriceDto pollMessage() {
+        try {
+            return messageQueue.poll();
+        } catch (Exception e) {
+            logger.error("Failed to poll message, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.pollMessage");
+            return null;
+        }
+    }
+
+    public int messageQueueSize() {
+        try {
+            return messageQueue.size();
+        } catch (Exception e) {
+            logger.error("Failed to get queue size, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.messageQueueSize");
+            return 0;
+        }
+    }
+
+    public int getActiveSubscriptions() {
+        try {
+            return 2; // Fixed for two RICs
+        } catch (Exception e) {
+            logger.error("Failed to get active subscriptions, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.getActiveSubscriptions");
+            return 0;
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        try {
+            unsubscribeAll();
+            logger.info("RefinitivOmmConsumer shutdown");
+        } catch (Exception e) {
+            logger.error("Failed to shutdown RefinitivOmmConsumer, error={}", e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.shutdown");
+        }
+    }
+
+    @Override
+    public void onRefreshMsg(RefreshMsg refreshMsg, OmmConsumerEvent event) {
+        logger.debug("Received RefreshMsg for RIC {}, domain={}", refreshMsg.name(), refreshMsg.domainType());
+        processMessage(refreshMsg, "REFRESH");
+    }
+
+    @Override
+    public void onUpdateMsg(UpdateMsg updateMsg, OmmConsumerEvent event) {
+        logger.debug("Received UpdateMsg for RIC {}, domain={}", updateMsg.name(), updateMsg.domainType());
+        processMessage(updateMsg, "UPDATE");
+    }
+
+    @Override
+    public void onStatusMsg(StatusMsg statusMsg, OmmConsumerEvent event) {
+        logger.info("Received StatusMsg for RIC {}, state={}", statusMsg.name(), statusMsg.state());
+    }
+
+    private void processMessage(Msg msg, String updateType) {
+        try {
+            if (msg.domainType() != EmaRdm.MMT_MARKET_PRICE) {
+                logger.debug("Ignoring non-market price message for RIC {}, domain={}", msg.name(), msg.domainType());
+                return;
+            }
+            String ric = msg.name();
+            if (ric == null || ric.isEmpty()) {
+                logger.warn("Received message with empty RIC, domain={}", msg.domainType());
+                return;
+            }
+            TreasuryPriceDto dto = new TreasuryPriceDto();
+            dto.setRic(ric);
+            dto.setTimestamp(LocalDateTime.now());
+            dto.setUpdateType(updateType);
+            dto.setLastUpdate(LocalDateTime.now());
+
+            FieldList fieldList = msg.payload().fieldList();
+            for (FieldEntry entry : fieldList) {
+                switch (entry.fieldId()) {
+                    case 22: // BID
+                        dto.setBidPrice(entry.doubleValue());
+                        break;
+                    case 25: // ASK
+                        dto.setAskPrice(entry.doubleValue());
+                        break;
+                    case 393: // YLD_1
+                        dto.setBidYield(entry.doubleValue());
+                        break;
+                    case 396: // ASK_YLD
+                        dto.setAskYield(entry.doubleValue());
+                        break;
+                }
+            }
+
+            long startTime = System.nanoTime();
+            boolean offered = messageQueue.offer(dto);
+            if (offered) {
+                logger.debug("Queued TreasuryPriceDto, ric={}, queue_size={}", ric, messageQueue.size());
+            } else {
+                logger.warn("Failed to queue TreasuryPriceDto, ric={}, queue full", ric);
+                meterRegistry.counter("queue_dropped_messages_total", "ric", ric).increment();
+            }
+        } catch (Exception e) {
+            logger.error("Failed to process message for RIC {}, error={}", msg.name(), e.getMessage(), e);
+            exceptionEmailService.sendExceptionEmail(e, "RefinitivOmmConsumer.processMessage");
+        }
+    }
+}
